@@ -1,0 +1,1 @@
+Mopey Bot is a Discord bot that plays music.
