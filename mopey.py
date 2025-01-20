@@ -1,6 +1,5 @@
 import discord
-from discord.ext import commands
-from discord.ext import tasks
+from discord.ext import commands, tasks
 import os
 import asyncio
 import yt_dlp
@@ -13,6 +12,10 @@ last_activity = {}  # Format: {guild_id: {'last_time': time(), 'channel': channe
 
 MAX_QUEUE_SIZE = 50  # Set a maximum size for the queue
 INACTIVITY_LIMIT = 600  # 10 minutes in seconds
+
+def format_duration(duration):
+    minutes, seconds = divmod(duration, 60)
+    return f"{minutes}:{seconds:02}"
 
 def run_bot():
     load_dotenv()
@@ -90,6 +93,99 @@ def run_bot():
             await ctx.send("An error occurred while trying to join the voice channel.")
 
 
+    @client.command(name="search")
+    async def search(ctx, *, query=None):
+        try:
+            if query is None:
+                await ctx.send("Please provide a valid search query.")
+                return
+            
+            await ctx.send("Searching...")
+            # Perform a YouTube search
+            query_string = urllib.parse.urlencode({'search_query': query})
+            content = urllib.request.urlopen(youtube_results_url + query_string)
+            search_results = list(dict.fromkeys(re.findall(r'/watch\?v=(.{11})', content.read().decode())))  # Remove duplicates
+
+            if not search_results:
+                await ctx.send("No results found for your query.")
+                return
+
+            # Get details for the top 3 results
+            titles_and_ids = []
+            for video_id in search_results[:3]:
+                data = ytdl.extract_info(f"{youtube_watch_url}{video_id}", download=False)
+                titles_and_ids.append({
+                    "title": data['title'],
+                    "link": f"{youtube_watch_url}{video_id}",
+                    "duration": data.get('duration', 0)  # Store duration as int
+                })
+
+            # Create an embed for the search results
+            embed = discord.Embed(
+                title="Search Results",
+                description="React with a number to choose a song or react with ❌ to cancel.",
+                color=discord.Color.dark_gray()
+            )
+            for i, result in enumerate(titles_and_ids, start=1):
+                embed.add_field(
+                    name=f"{i}️⃣",
+                    value=f"`[{format_duration(result['duration'])}]` {result['title']}",
+                    inline=False
+                )
+
+            # Send the embed and add reactions
+            message = await ctx.send(embed=embed)
+            reactions = ["1️⃣", "2️⃣", "3️⃣", "❌"]
+            for reaction in reactions:
+                await message.add_reaction(reaction)
+
+            def check(reaction, user):
+                return (
+                    user == ctx.author
+                    and str(reaction.emoji) in reactions
+                    and reaction.message.id == message.id
+                )
+
+            try:
+                reaction, _ = await client.wait_for("reaction_add", timeout=30.0, check=check)
+                if str(reaction.emoji) == "❌":
+                    await ctx.send("Search canceled.")
+                    return
+
+                # Determine which song was chosen based on the emoji
+                choice_index = reactions.index(str(reaction.emoji))
+                chosen_result = titles_and_ids[choice_index]
+
+                # Add the chosen song to the queue
+                if ctx.guild.id not in queues:
+                    queues[ctx.guild.id] = []
+
+                # Avoid adding the song twice (check if the song is already in the queue)
+                if any(song['link'] == chosen_result['link'] for song in queues[ctx.guild.id]):
+                    await ctx.send(f"**{chosen_result['title']}** is already in the queue.")
+                    return
+
+
+                # Play immediately if nothing is playing
+                if ctx.guild.id not in voice_clients or not voice_clients[ctx.guild.id].is_playing():
+                    await play(ctx, link=chosen_result['link'])
+                else:
+                    queues[ctx.guild.id].append({
+                    "title": chosen_result['title'],
+                    "link": chosen_result['link'],
+                    "duration": chosen_result['duration']
+                    })
+                    await ctx.send(f"Added to queue: **{chosen_result['title']}** ({format_duration(chosen_result['duration'])})")
+
+            except asyncio.TimeoutError:
+                await ctx.send("You took too long to respond! Search canceled.")
+
+        except Exception as e:
+            print(e)
+            await ctx.send("An error occurred while processing your search.")
+
+
+
     @client.command(name="play")
     async def play(ctx, *, link=None):
         try:
@@ -134,8 +230,8 @@ def run_bot():
                 if len(queues[ctx.guild.id]) >= MAX_QUEUE_SIZE:
                     await ctx.send("The queue is full. Please wait for some songs to finish before adding more.")
                     return
-                queues[ctx.guild.id].append({"title": title, "link": link})
-                await ctx.send(f"Added to queue: **{title}** (Position: {len(queues[ctx.guild.id])})")
+                queues[ctx.guild.id].append({"title": title, "link": link, "duration": duration})
+                await ctx.send(f"Added to queue: **{title}** ({format_duration(duration)}) (Position: {len(queues[ctx.guild.id])})")
             else:
                 # Play the song if nothing is playing
                 player = discord.FFmpegOpusAudio(song, **ffmpeg_options)
@@ -148,7 +244,7 @@ def run_bot():
                     "duration": duration
                 }
 
-                await ctx.send(f"Now playing: **{title}**")
+                await ctx.send(f"Now playing: **{title}** ({format_duration(duration)})")
 
         except Exception as e:
             print(e)
@@ -166,7 +262,7 @@ def run_bot():
     async def remove(ctx, position: int = 0):
         if ctx.guild.id in queues and 0 < position <= len(queues[ctx.guild.id]):
             removed_song = queues[ctx.guild.id].pop(position - 1)
-            await ctx.send(f"Removed: **{removed_song['title']}** from the queue.")
+            await ctx.send(f"Removed: **{removed_song['title']}** ({format_duration(removed_song['duration'])}) from the queue.")
         else:
             await ctx.send("Invalid position. Please provide a valid number within the queue.")
 
@@ -180,7 +276,7 @@ def run_bot():
             # Stop the current song to trigger the after callback
             voice_clients[ctx.guild.id].stop()
 
-            await ctx.send(f"Grabbing **{selected_song['title']}** from the queue.")
+            await ctx.send(f"Grabbing **{selected_song['title']}** ({format_duration(selected_song['duration'])}) from the queue.")
         else:
             await ctx.send("Invalid position. Please provide a valid number within the queue.")
 
@@ -213,8 +309,8 @@ def run_bot():
     @client.command(name="queue")
     async def queue(ctx):
         if ctx.guild.id in queues and queues[ctx.guild.id]:
-            # Display the queue with titles and positions
-            queue_list = "\n".join([f"{idx + 1}. {item['title']}" for idx, item in enumerate(queues[ctx.guild.id])])
+            # Display the queue with titles, positions, and durations
+            queue_list = "\n".join([f"{idx + 1}. {item['title']} ({format_duration(item['duration'])})" for idx, item in enumerate(queues[ctx.guild.id])])
             await ctx.send(f"Current queue:\n{queue_list}")
         else:
             await ctx.send("The queue is empty!")
@@ -222,12 +318,31 @@ def run_bot():
     @client.command(name="skip")
     async def skip(ctx):
         try:
-            voice_clients[ctx.guild.id].stop()
-            await ctx.send("Song skipped, now playing next in the queue.")
+            # Check if the bot is connected to a voice channel
+            if ctx.guild.id not in voice_clients or not voice_clients[ctx.guild.id].is_connected():
+                await ctx.send("I'm not connected to a voice channel.")
+                return
+            
+            # Check if a song is currently playing
+            if not voice_clients[ctx.guild.id].is_playing():
+                await ctx.send("There's nothing to skip, no song is currently playing.")
+                return
+            
+            # Check if the queue is empty
+            if not queues.get(ctx.guild.id) or len(queues[ctx.guild.id]) == 0:
+                voice_clients[ctx.guild.id].stop()  # Stop the current song
+                await ctx.send("Song skipped. No more songs in the queue.")
+            else:
+                # Stop the current song and play the next one in the queue
+                voice_clients[ctx.guild.id].stop()
+                await ctx.send("Song skipped, now playing next in the queue.")
+                # You could add play_next(ctx) here to start the next song
+
         except Exception as e:
             print(e)
             await ctx.send("An error occurred while trying to skip the song.")
 
+            
     @client.command(name="seek")
     async def seek(ctx, seconds: int):
         try:
@@ -261,7 +376,7 @@ def run_bot():
             # Start playback from the new position
             voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), client.loop))
             current_song_data[ctx.guild.id]["start_time"] = time() - new_position  # Update start time
-            await ctx.send(f"Seeked to {int(new_position)} seconds.")
+            await ctx.send(f"Seeked to {format_duration(int(new_position))}.")
 
         except Exception as e:
             print(e)
@@ -281,6 +396,7 @@ def run_bot():
             "**.stop** - Stop the song and disconnect from the voice channel\n"
             "**.skip** - Skip the current song and play the next one in the queue\n"
             "**.seek <seconds>** - Fast forward or rewind the current song by the specified number of seconds\n"
+            "**.search <query>** - Search YouTube for a query and choose a result to add to the queue\n"
             "**.commands** - Show this list of commands"
         )
 
