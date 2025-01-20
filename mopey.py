@@ -8,7 +8,6 @@ from dotenv import load_dotenv
 import urllib.parse, urllib.request, re
 from time import time
 
-# Initialize global variables
 current_song_data = {}  # Tracks the current song info per guild, including start time and duration
 last_activity = {}  # Format: {guild_id: {'last_time': time(), 'channel': channel}}
 
@@ -251,7 +250,7 @@ def run_bot():
 
             # Restart the song from the new position
             voice_client = voice_clients[ctx.guild.id]
-            voice_client.stop()  # Stop the current playback
+            voice_client.pause()  # Pause the current playback
 
             ffmpeg_options_with_seek = {
                 'before_options': f'-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -ss {new_position}',
