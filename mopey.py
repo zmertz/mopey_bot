@@ -4,14 +4,65 @@ import os
 import asyncio
 import yt_dlp
 from dotenv import load_dotenv
-import urllib.parse, urllib.request, re
 from time import time
+from plexapi.server import PlexServer
+import traceback
+
+plex = None
 
 current_song_data = {}  # Tracks the current song info per guild, including start time and duration
 last_activity = {}  # Format: {guild_id: {'last_time': time(), 'channel': channel}}
 
 MAX_QUEUE_SIZE = 50  # Set a maximum size for the queue
 INACTIVITY_LIMIT = 600  # 10 minutes in seconds
+
+def get_plex_connection(url, token):
+    global plex
+    if plex:
+        return plex
+    try:
+        plex = PlexServer(url, token)
+        print("✅ Connected to Plex server.")
+        return plex
+    except Exception as e:
+        print(f"❌ Failed to connect to Plex: {e}")
+        print(f"PLEX URL: {url}")
+        print(f"PLEX_TOKEN: {token}")
+        return None
+
+
+def search_plex_music(query, url, token):
+    plex_conn = get_plex_connection(url, token)
+    if not plex_conn:
+        print("Plex connection is not available.")
+        return []
+
+    try:
+        results = plex_conn.search(query, mediatype='track')
+    except Exception as e:
+        print(f"Error during Plex search: {e}")
+        return []
+
+    songs = []
+    for track in results:
+        try:
+            if hasattr(track, 'title') and hasattr(track, 'parentTitle') and track.media:
+                # Build the stream URL
+                media_part = track.media[0].parts[0]
+                key = media_part.key
+                stream_url = f"{url}{key}?X-Plex-Token={token}"
+
+                songs.append({
+                    'title': track.title,
+                    'artist': track.parentTitle,
+                    'album': getattr(track, 'grandparentTitle', 'Unknown Album'),
+                    'duration': track.duration // 1000 if track.duration else 0,
+                    'url': stream_url
+                })
+        except Exception as e:
+            print(f"Error parsing Plex result: {e}")
+    return songs
+
 
 def format_duration(duration):
     minutes, seconds = divmod(duration, 60)
@@ -20,16 +71,21 @@ def format_duration(duration):
 def run_bot():
     load_dotenv()
     TOKEN = os.getenv('discord_token')
+    PLEX_BASE_URL = os.getenv("plex_base_url")
+    PLEX_TOKEN = os.getenv("plex_token")
     intents = discord.Intents.default()
     intents.message_content = True
     client = commands.Bot(command_prefix=".", intents=intents)
 
     queues = {}
     voice_clients = {}
-    youtube_base_url = 'https://www.youtube.com/'
-    youtube_results_url = youtube_base_url + 'results?'
-    youtube_watch_url = youtube_base_url + 'watch?v='
-    yt_dl_options = {"format": "bestaudio/best"}
+    yt_dl_options = {
+        "format": "bestaudio/best",     # Best available audio-only format
+        "noplaylist": True,             # Only download/play a single video, not entire playlists
+        "quiet": True,                  # Suppress verbose console output from yt-dlp
+        "default_search": "ytsearch",  # If no URL is given, treat input as a search term
+        "source_address": "0.0.0.0",    # Sometimes helps avoid geo-restriction issues
+    }
     ytdl = yt_dlp.YoutubeDL(yt_dl_options)
 
     ffmpeg_options = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5','options': '-vn -filter:a "volume=0.25"'}
@@ -47,6 +103,7 @@ def run_bot():
             
             # If the bot is playing music, don't disconnect
             if voice_client and voice_client.is_playing():
+                data['last_time'] = time()  # Reset the time
                 continue  # Skip inactivity check if the bot is playing music
             
             # If the bot is not playing music and has been inactive for more than 10 minutes
@@ -60,14 +117,14 @@ def run_bot():
                     # Send the disconnect message to the stored channel
                     if 'channel' in data:
                         channel = data['channel']
-                        await channel.send("Music stopped and disconnected due to inactivity.")
+                        await channel.send("Disconnected due to inactivity.")
 
 
     async def play_next(ctx):
-        if queues[ctx.guild.id] != []:
+        if queues.get(ctx.guild.id):
             next_song = queues[ctx.guild.id].pop(0)
-            link = next_song["link"]
-            await play(ctx, link=link)
+            await play(ctx, link=next_song["link"], title=next_song.get("title"), duration=next_song.get("duration"))
+
 
     @client.command(name="join")
     async def join(ctx):
@@ -101,29 +158,29 @@ def run_bot():
                 return
             
             await ctx.send("Searching...")
-            # Perform a YouTube search
-            query_string = urllib.parse.urlencode({'search_query': query})
-            content = urllib.request.urlopen(youtube_results_url + query_string)
-            search_results = list(dict.fromkeys(re.findall(r'/watch\?v=(.{11})', content.read().decode())))  # Remove duplicates
 
-            if not search_results:
+            loop = asyncio.get_event_loop()
+            # 'ytsearch3:' tells yt-dlp to return top 3 search results for the query
+            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(f"ytsearch3:{query}", download=False))
+
+            # Extract the entries (videos) from search results
+            entries = data.get('entries', [])
+            if not entries:
                 await ctx.send("No results found for your query.")
                 return
 
-            # Get details for the top 3 results
+            # Collect titles, links, durations for top 3
             titles_and_ids = []
-            for video_id in search_results[:3]:
-                data = ytdl.extract_info(f"{youtube_watch_url}{video_id}", download=False)
+            for entry in entries[:3]:
                 titles_and_ids.append({
-                    "title": data['title'],
-                    "link": f"{youtube_watch_url}{video_id}",
-                    "duration": data.get('duration', 0)  # Store duration as int
+                    "title": entry.get('title', 'Unknown Title'),
+                    "link": entry.get('webpage_url'),
+                    "duration": entry.get('duration', 0)
                 })
 
             # Create an embed for the search results
             embed = discord.Embed(
                 title="Search Results",
-                description="React with a number to choose a song or react with ❌ to cancel.",
                 color=discord.Color.dark_gray()
             )
             for i, result in enumerate(titles_and_ids, start=1):
@@ -160,20 +217,19 @@ def run_bot():
                 if ctx.guild.id not in queues:
                     queues[ctx.guild.id] = []
 
-                # Avoid adding the song twice (check if the song is already in the queue)
+                # Avoid adding the song twice
                 if any(song['link'] == chosen_result['link'] for song in queues[ctx.guild.id]):
                     await ctx.send(f"**{chosen_result['title']}** is already in the queue.")
                     return
-
 
                 # Play immediately if nothing is playing
                 if ctx.guild.id not in voice_clients or not voice_clients[ctx.guild.id].is_playing():
                     await play(ctx, link=chosen_result['link'])
                 else:
                     queues[ctx.guild.id].append({
-                    "title": chosen_result['title'],
-                    "link": chosen_result['link'],
-                    "duration": chosen_result['duration']
+                        "title": chosen_result['title'],
+                        "link": chosen_result['link'],
+                        "duration": chosen_result['duration']
                     })
                     await ctx.send(f"Added to queue: **{chosen_result['title']}** ({format_duration(chosen_result['duration'])})")
 
@@ -185,14 +241,12 @@ def run_bot():
             await ctx.send("An error occurred while processing your search.")
 
 
-
     @client.command(name="play")
-    async def play(ctx, *, link=None):
+    async def play(ctx, *, link=None, title=None, duration=None):
         try:
-            # Update last activity time when music is played and what text channel request was sent in
+            # Update last activity time and text channel
             last_activity[ctx.guild.id] = {'last_time': time(), 'channel': ctx.channel}
 
-            # Resume if no link is provided and music is paused
             if link is None:
                 if ctx.guild.id in voice_clients and voice_clients[ctx.guild.id].is_paused():
                     voice_clients[ctx.guild.id].resume()
@@ -201,45 +255,67 @@ def run_bot():
                 else:
                     await ctx.send("No music is currently paused to resume.")
                     return
-
-            # Connect to the voice channel if not already connected
+            # Connect to voice channel if needed
             if ctx.guild.id not in voice_clients or not voice_clients[ctx.guild.id].is_connected():
-                voice_client = await ctx.author.voice.channel.connect()
-                voice_clients[ctx.guild.id] = voice_client
+                if ctx.author.voice and ctx.author.voice.channel:
+                    voice_client = await ctx.author.voice.channel.connect()
+                    voice_clients[ctx.guild.id] = voice_client
+                else:
+                    await ctx.send("You must be connected to a voice channel to play music.")
+                    return
             else:
                 voice_client = voice_clients[ctx.guild.id]
 
-            # Check if the link is a search query or direct YouTube link
-            if youtube_base_url not in link:
-                query_string = urllib.parse.urlencode({'search_query': link})
-                content = urllib.request.urlopen(youtube_results_url + query_string)
-                search_results = re.findall(r'/watch\?v=(.{11})', content.read().decode())
-                link = youtube_watch_url + search_results[0]
+            # Detect if this is a Plex URL by checking if link starts with your Plex base URL
+            is_plex_link = False
+            if link.startswith(PLEX_BASE_URL):
+                is_plex_link = True
 
-            # Extract song data
-            loop = asyncio.get_event_loop()
-            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(link, download=False))
-            song = data['url']
-            title = data['title']
-            duration = data.get('duration', 0)  # Duration in seconds
+            if is_plex_link:
+                # Use passed title/duration or fallback values
+                song_url = link
+                if title is None:
+                    title = "Plex Track"
+                if duration is None:
+                    duration = 0
+            else:
+                loop = asyncio.get_event_loop()
+                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(link, download=False))
+                
+                # Handle search results (ytsearch returns a playlist of entries)
+                if 'entries' in data:
+                    data = data['entries'][0]
 
-            # Add to queue if a song is already playing
+                if 'url' not in data:
+                    await ctx.send("Could not extract a playable video URL.")
+                    return
+                                
+                song_url = data['url']
+                title = data['title']
+                duration = data.get('duration', 0)
+                print("Info", song_url, title, duration)
+
+            # Add to queue if already playing
             if voice_client.is_playing():
                 if ctx.guild.id not in queues:
                     queues[ctx.guild.id] = []
                 if len(queues[ctx.guild.id]) >= MAX_QUEUE_SIZE:
                     await ctx.send("The queue is full. Please wait for some songs to finish before adding more.")
                     return
-                queues[ctx.guild.id].append({"title": title, "link": link, "duration": duration})
+                queues[ctx.guild.id].append({
+                    "title": title,
+                    "link": link,
+                    "duration": duration
+                })
                 await ctx.send(f"Added to queue: **{title}** ({format_duration(duration)}) (Position: {len(queues[ctx.guild.id])})")
             else:
-                # Play the song if nothing is playing
-                player = discord.FFmpegOpusAudio(song, **ffmpeg_options)
+                # Play immediately
+                player = discord.FFmpegOpusAudio(song_url, **ffmpeg_options)
                 voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), client.loop))
 
                 # Update current song data
                 current_song_data[ctx.guild.id] = {
-                    "url": song,
+                    "url": song_url,
                     "start_time": time(),
                     "duration": duration
                 }
@@ -248,7 +324,9 @@ def run_bot():
 
         except Exception as e:
             print(e)
+            traceback.print_exc()
             await ctx.send("An error occurred while trying to play the song.")
+
 
     @client.command(name="clear")
     async def clear(ctx):
@@ -336,7 +414,6 @@ def run_bot():
                 # Stop the current song and play the next one in the queue
                 voice_clients[ctx.guild.id].stop()
                 await ctx.send("Song skipped, now playing next in the queue.")
-                # You could add play_next(ctx) here to start the next song
 
         except Exception as e:
             print(e)
@@ -382,6 +459,139 @@ def run_bot():
             print(e)
             await ctx.send("An error occurred while trying to seek.")
 
+
+    @client.command(name="plex")
+    async def plex(ctx, *, query=None):
+        try:
+            if query is None:
+                await ctx.send("Please provide a song name to search on Plex.")
+                return
+
+            # Make sure we're connected to Plex
+            plex_conn = get_plex_connection(PLEX_BASE_URL, PLEX_TOKEN)
+            if not plex_conn:
+                await ctx.send("Plex is not available or not configured correctly.")
+                return
+
+            await ctx.send(f"Searching Plex for '{query}'...")
+            songs = search_plex_music(query, PLEX_BASE_URL, PLEX_TOKEN)
+            if not songs:
+                await ctx.send("No songs found on Plex.")
+                return
+
+            # Pick the closest match (first result)
+            selected = songs[0]
+
+            # Ensure voice client connection
+            if ctx.guild.id not in voice_clients or not voice_clients[ctx.guild.id].is_connected():
+                if ctx.author.voice:
+                    channel = ctx.author.voice.channel
+                    voice_clients[ctx.guild.id] = await channel.connect()
+                else:
+                    await ctx.send("You must be in a voice channel to play music.")
+                    return
+
+            # Initialize queue if needed
+            if ctx.guild.id not in queues:
+                queues[ctx.guild.id] = []
+
+            # If nothing is playing, play immediately; else queue
+            if not voice_clients[ctx.guild.id].is_playing():
+                await play(ctx, link=selected['url'], title=selected['title'], duration=selected['duration'])
+            else:
+                queues[ctx.guild.id].append({
+                    "title": selected["title"],
+                    "link": selected["url"],
+                    "duration": selected["duration"]
+                })
+                await ctx.send(f"Added to queue: **{selected['title']}** ({format_duration(selected['duration'])})")
+
+        except Exception as e:
+            print(e)
+            await ctx.send("An error occurred while trying to play the song from Plex.")
+
+
+    @client.command(name="plexsearch")
+    async def plexsearch(ctx, *, query=None):
+        try:
+            if query is None:
+                await ctx.send("Please provide a search query for Plex.")
+                return
+
+            # Make sure we're connected to Plex
+            if not get_plex_connection(PLEX_BASE_URL, PLEX_TOKEN):
+                await ctx.send("Plex is not available or not configured correctly.")
+                return
+
+            await ctx.send("Searching Plex...")
+            songs = search_plex_music(query, PLEX_BASE_URL, PLEX_TOKEN)
+            if not songs:
+                await ctx.send("No songs found on Plex.")
+                return
+
+            # Show the top 3 results
+            embed = discord.Embed(title="Plex Search Results", color=discord.Color.dark_gold())
+            top_results = songs[:3]
+            for i, song in enumerate(top_results, start=1):
+                embed.add_field(
+                    name=f"{i}️⃣",
+                    value=f"`[{format_duration(song['duration'])}]` {song['title']} - {song['artist']} (Album: {song['album']})",
+                    inline=False
+                )
+
+            message = await ctx.send(embed=embed)
+            reactions = ["1️⃣", "2️⃣", "3️⃣", "❌"]
+            for r in reactions[:len(top_results)+1]:
+                await message.add_reaction(r)
+
+            def check(reaction, user):
+                return (
+                    user == ctx.author and
+                    str(reaction.emoji) in reactions and
+                    reaction.message.id == message.id
+                )
+
+            try:
+                reaction, _ = await client.wait_for("reaction_add", timeout=30.0, check=check)
+                if str(reaction.emoji) == "❌":
+                    await ctx.send("Search canceled.")
+                    return
+
+                index = reactions.index(str(reaction.emoji))
+                selected = top_results[index]
+
+                # Ensure voice client connection
+                if ctx.guild.id not in voice_clients or not voice_clients[ctx.guild.id].is_connected():
+                    if ctx.author.voice:
+                        channel = ctx.author.voice.channel
+                        voice_clients[ctx.guild.id] = await channel.connect()
+                    else:
+                        await ctx.send("You must be in a voice channel to play music.")
+                        return
+
+                # Queue system
+                if ctx.guild.id not in queues:
+                    queues[ctx.guild.id] = []
+
+                # Start playback if nothing is playing
+                if not voice_clients[ctx.guild.id].is_playing():
+                    await play(ctx, link=selected['url'], title=selected['title'], duration=selected['duration'])
+                else:
+                    queues[ctx.guild.id].append({
+                        "title": selected["title"],
+                        "link": selected["url"],
+                        "duration": selected["duration"]
+                    })
+                    await ctx.send(f"Added to queue: **{selected['title']}** ({format_duration(selected['duration'])})")
+
+            except asyncio.TimeoutError:
+                await ctx.send("You took too long to respond! Search canceled.")
+
+        except Exception as e:
+            print(e)
+            await ctx.send("An error occurred while processing your Plex search.")
+
+
     @client.command(name="commands")
     async def commands_list(ctx):
         command_list = (
@@ -397,6 +607,8 @@ def run_bot():
             "**.skip** - Skip the current song and play the next one in the queue\n"
             "**.seek <seconds>** - Fast forward or rewind the current song by the specified number of seconds\n"
             "**.search <query>** - Search YouTube for a query and choose a result to add to the queue\n"
+            "**.plex <query>** - Plays the first result returned by <query> from the plex server\n"
+            "**.plexsearch <query>** - Search connected Plex server for a query and choose a result to add to the queue\n"
             "**.commands** - Show this list of commands"
         )
 
