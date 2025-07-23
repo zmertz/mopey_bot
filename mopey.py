@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from time import time
 from plexapi.server import PlexServer
 import traceback
+import playback_controls
 
 plex = None
 
@@ -15,6 +16,79 @@ last_activity = {}  # Format: {guild_id: {'last_time': time(), 'channel': channe
 
 MAX_QUEUE_SIZE = 50  # Set a maximum size for the queue
 INACTIVITY_LIMIT = 600  # 10 minutes in seconds
+
+def format_time(seconds):
+        return f"{seconds // 60}:{seconds % 60:02d}"
+
+def create_song_info_text(title, duration, artist=None, album=None):
+    song_info_string = title
+    if artist:
+        song_info_string += f" - {artist}"
+    if album:
+        song_info_string += f" - {album}"
+    song_info_string += f" - (*{format_time(duration)}*)"
+    return song_info_string
+
+async def show_now_playing(ctx, curr_song, next_song, client):
+    """
+    Displays a full embed with detailed information about the currently playing song.
+    """
+
+    if not curr_song or "title" not in curr_song:
+        await ctx.send("❌ No song is currently playing.")
+        return
+
+    title = curr_song.get("title", "Unknown Title")
+    duration = curr_song.get("duration", 0)
+    artist = curr_song.get("artist", None)
+    album = curr_song.get("album", None)
+    start_time = curr_song.get("start_time", time())
+    thumbnail = curr_song.get("thumbnail", None)  # Optional
+
+    elapsed = int(time() - start_time)
+    elapsed = max(0, min(elapsed, duration))  # Clamp
+
+    detail_line = create_song_info_text(title, duration, artist, album)
+
+    # Build next song line
+    if next_song:
+        next_title = next_song.get("title", "Unknown Title")
+        next_duration = next_song.get("duration", 0)
+        next_artist = next_song.get("artist", None)
+        next_album = next_song.get("album", None)
+
+        next_detail_line = create_song_info_text(next_title, next_duration, next_artist, next_album)
+    else:
+        next_detail_line = "❌ `Nothing next in queue`"
+
+    
+    # Optional time progress bar (just for visual appeal)
+    def build_progress_bar(elapsed, total, length=20):
+        progress = int((elapsed / total) * length) if total else 0
+        bar = "■" * progress + "─ " * (length - progress)
+        return f"[{bar}]"
+
+    embed = discord.Embed(
+        title="Now Playing",
+        #description=f"Currently Playing:\n{detail_line}",
+        description=f"{detail_line}",
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(
+        name="Progress",
+        value=f"▶️ {format_time(elapsed)} - {build_progress_bar(elapsed, duration)} - {format_time(duration)}",
+        inline=False
+    )
+
+    embed.add_field(name="Next", value=next_detail_line, inline=False)
+
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
+
+    view = playback_controls.PlaybackControls(ctx, client)
+    await ctx.send(embed=embed, view=view)
+
 
 def get_plex_connection(url, token):
     global plex
@@ -54,10 +128,11 @@ def search_plex_music(query, url, token):
 
                 songs.append({
                     'title': track.title,
-                    'artist': track.parentTitle,
-                    'album': getattr(track, 'grandparentTitle', 'Unknown Album'),
+                    'artist': getattr(track, 'grandparentTitle', None),
+                    'album': getattr(track, 'parentTitle', None),
                     'duration': track.duration // 1000 if track.duration else 0,
-                    'url': stream_url
+                    'url': stream_url,
+                    'thumbnail': track.artUrl
                 })
         except Exception as e:
             print(f"Error parsing Plex result: {e}")
@@ -88,7 +163,18 @@ def run_bot():
     }
     ytdl = yt_dlp.YoutubeDL(yt_dl_options)
 
-    ffmpeg_options = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5','options': '-vn -filter:a "volume=0.25"'}
+    ffmpeg_options = {
+        'before_options': (
+            '-reconnect 1 '
+            '-reconnect_streamed 1 '
+            '-reconnect_delay_max 5 '
+            '-probesize 5000000 '
+            '-analyzeduration 10000000'
+        ),
+        'options': '-vn -filter:a "volume=0.25"'
+    }
+
+
 
     @client.event
     async def on_ready():
@@ -123,7 +209,11 @@ def run_bot():
     async def play_next(ctx):
         if queues.get(ctx.guild.id):
             next_song = queues[ctx.guild.id].pop(0)
-            await play(ctx, link=next_song["link"], title=next_song.get("title"), duration=next_song.get("duration"))
+            await play(ctx, link=next_song["link"], title=next_song.get("title"), duration=next_song.get("duration"), artist=next_song.get("artist"), album=next_song.get("album"), thumbnail=next_song.get("thumbnail"))
+        else:
+            # Queue is empty, clear current song data
+            if ctx.guild.id in current_song_data:
+                del current_song_data[ctx.guild.id]
 
 
     @client.command(name="join")
@@ -231,7 +321,8 @@ def run_bot():
                         "link": chosen_result['link'],
                         "duration": chosen_result['duration']
                     })
-                    await ctx.send(f"Added to queue: **{chosen_result['title']}** ({format_duration(chosen_result['duration'])})")
+                    detail_line = create_song_info_text(chosen_result['title'], chosen_result['duration'])
+                    await ctx.send(f"Added to queue: **{detail_line}** (Position: {len(queues[ctx.guild.id])})")
 
             except asyncio.TimeoutError:
                 await ctx.send("You took too long to respond! Search canceled.")
@@ -242,9 +333,8 @@ def run_bot():
 
 
     @client.command(name="play")
-    async def play(ctx, *, link=None, title=None, duration=None):
+    async def play(ctx, *, link=None, title=None, duration=None, artist=None, album=None, thumbnail=None):
         try:
-            # Update last activity time and text channel
             last_activity[ctx.guild.id] = {'last_time': time(), 'channel': ctx.channel}
 
             if link is None:
@@ -255,6 +345,7 @@ def run_bot():
                 else:
                     await ctx.send("No music is currently paused to resume.")
                     return
+
             # Connect to voice channel if needed
             if ctx.guild.id not in voice_clients or not voice_clients[ctx.guild.id].is_connected():
                 if ctx.author.voice and ctx.author.voice.channel:
@@ -266,36 +357,27 @@ def run_bot():
             else:
                 voice_client = voice_clients[ctx.guild.id]
 
-            # Detect if this is a Plex URL by checking if link starts with your Plex base URL
-            is_plex_link = False
-            if link.startswith(PLEX_BASE_URL):
-                is_plex_link = True
-
+            # Detect Plex URL
+            is_plex_link = link.startswith(PLEX_BASE_URL)
             if is_plex_link:
-                # Use passed title/duration or fallback values
                 song_url = link
-                if title is None:
-                    title = "Plex Track"
-                if duration is None:
-                    duration = 0
+                title = title or "Plex Track"
+                duration = duration or 0
             else:
                 loop = asyncio.get_event_loop()
                 data = await loop.run_in_executor(None, lambda: ytdl.extract_info(link, download=False))
-                
-                # Handle search results (ytsearch returns a playlist of entries)
                 if 'entries' in data:
                     data = data['entries'][0]
-
                 if 'url' not in data:
                     await ctx.send("Could not extract a playable video URL.")
                     return
-                                
+
                 song_url = data['url']
                 title = data['title']
                 duration = data.get('duration', 0)
-                print("Info", song_url, title, duration)
+                thumbnail = data.get('thumbnail')
 
-            # Add to queue if already playing
+            # If currently playing, queue the song
             if voice_client.is_playing():
                 if ctx.guild.id not in queues:
                     queues[ctx.guild.id] = []
@@ -305,27 +387,57 @@ def run_bot():
                 queues[ctx.guild.id].append({
                     "title": title,
                     "link": link,
-                    "duration": duration
+                    "duration": duration,
+                    "artist": artist,
+                    "album": album,
+                    "thumbnail": thumbnail
                 })
-                await ctx.send(f"Added to queue: **{title}** ({format_duration(duration)}) (Position: {len(queues[ctx.guild.id])})")
+                detail_line = create_song_info_text(title, duration, artist, album)
+                await ctx.send(f"Added to queue: **{detail_line}** (Position: {len(queues[ctx.guild.id])})")
             else:
-                # Play immediately
                 player = discord.FFmpegOpusAudio(song_url, **ffmpeg_options)
                 voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), client.loop))
 
-                # Update current song data
                 current_song_data[ctx.guild.id] = {
-                    "url": song_url,
+                    "title": title,
+                    "duration": duration,
+                    "artist": artist,
+                    "album": album,
                     "start_time": time(),
-                    "duration": duration
+                    "url": song_url,
+                    "thumbnail": thumbnail
                 }
+          
+                next_song = None
+                if ctx.guild.id in queues and queues[ctx.guild.id]:
+                    next_song = queues[ctx.guild.id][0]
 
-                await ctx.send(f"Now playing: **{title}** ({format_duration(duration)})")
+                await show_now_playing(ctx, current_song_data[ctx.guild.id], next_song, client)
+
 
         except Exception as e:
             print(e)
             traceback.print_exc()
             await ctx.send("An error occurred while trying to play the song.")
+
+
+    @client.command(name="playing")
+    async def playing(ctx):
+        # Check if something is currently playing
+        if ctx.guild.id not in current_song_data:
+            await ctx.send("No song is currently playing.")
+            return
+
+        # Get current song info
+        curr_song = current_song_data[ctx.guild.id]
+
+        # Get the next song in the queue (if any)
+        next_song = None
+        if ctx.guild.id in queues and queues[ctx.guild.id]:
+            next_song = queues[ctx.guild.id][0]
+
+        # Show the now playing embed
+        await show_now_playing(ctx, curr_song, next_song, client)
 
 
     @client.command(name="clear")
@@ -387,11 +499,29 @@ def run_bot():
     @client.command(name="queue")
     async def queue(ctx):
         if ctx.guild.id in queues and queues[ctx.guild.id]:
-            # Display the queue with titles, positions, and durations
-            queue_list = "\n".join([f"{idx + 1}. {item['title']} ({format_duration(item['duration'])})" for idx, item in enumerate(queues[ctx.guild.id])])
-            await ctx.send(f"Current queue:\n{queue_list}")
+            embed = discord.Embed(
+                title="🎶 Current Queue 🎶",
+                #description="Here's what's coming up:",
+                color=discord.Color.blurple()
+            )
+
+            queue_items = queues[ctx.guild.id]
+            for idx, item in enumerate(queue_items[:5]):
+                detail_line = create_song_info_text(item['title'], item['duration'], item.get('artist'), item.get('album'))
+                embed.add_field(name="\u200b", value=f"**{idx + 1}.** {detail_line}", inline=False)
+
+            remaining = len(queue_items) - 5
+            if remaining > 0:
+                embed.add_field(
+                    name="\u200b",
+                    value=f"*...and {remaining} more song{'s' if remaining != 1 else ''} in the queue.*",
+                    inline=False
+                )
+
+            await ctx.send(embed=embed)
         else:
             await ctx.send("The queue is empty!")
+
 
     @client.command(name="skip")
     async def skip(ctx):
@@ -453,7 +583,10 @@ def run_bot():
             # Start playback from the new position
             voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), client.loop))
             current_song_data[ctx.guild.id]["start_time"] = time() - new_position  # Update start time
-            await ctx.send(f"Seeked to {format_duration(int(new_position))}.")
+            if int(new_position) == 0:
+                await ctx.send(f"Restarting song")
+            else:
+                await ctx.send(f"Seeked to {format_duration(int(new_position))}.")
 
         except Exception as e:
             print(e)
@@ -479,32 +612,19 @@ def run_bot():
                 await ctx.send("No songs found on Plex.")
                 return
 
-            # Pick the closest match (first result)
+            # Use the top result
             selected = songs[0]
 
-            # Ensure voice client connection
-            if ctx.guild.id not in voice_clients or not voice_clients[ctx.guild.id].is_connected():
-                if ctx.author.voice:
-                    channel = ctx.author.voice.channel
-                    voice_clients[ctx.guild.id] = await channel.connect()
-                else:
-                    await ctx.send("You must be in a voice channel to play music.")
-                    return
-
-            # Initialize queue if needed
-            if ctx.guild.id not in queues:
-                queues[ctx.guild.id] = []
-
-            # If nothing is playing, play immediately; else queue
-            if not voice_clients[ctx.guild.id].is_playing():
-                await play(ctx, link=selected['url'], title=selected['title'], duration=selected['duration'])
-            else:
-                queues[ctx.guild.id].append({
-                    "title": selected["title"],
-                    "link": selected["url"],
-                    "duration": selected["duration"]
-                })
-                await ctx.send(f"Added to queue: **{selected['title']}** ({format_duration(selected['duration'])})")
+            # ✅ Call your existing play command
+            await play(
+                ctx,
+                link=selected['url'],
+                title=selected.get('title'),
+                duration=selected.get('duration'),
+                artist=selected.get('artist'),
+                album=selected.get('album'),
+                thumbnail=selected.get('thumbnail')
+            )
 
         except Exception as e:
             print(e)
@@ -539,9 +659,11 @@ def run_bot():
                     inline=False
                 )
 
+            reactions = ["1️⃣", "2️⃣", "3️⃣"][:len(top_results)]
+            reactions.append("❌")
+
             message = await ctx.send(embed=embed)
-            reactions = ["1️⃣", "2️⃣", "3️⃣", "❌"]
-            for r in reactions[:len(top_results)+1]:
+            for r in reactions:
                 await message.add_reaction(r)
 
             def check(reaction, user):
@@ -560,29 +682,16 @@ def run_bot():
                 index = reactions.index(str(reaction.emoji))
                 selected = top_results[index]
 
-                # Ensure voice client connection
-                if ctx.guild.id not in voice_clients or not voice_clients[ctx.guild.id].is_connected():
-                    if ctx.author.voice:
-                        channel = ctx.author.voice.channel
-                        voice_clients[ctx.guild.id] = await channel.connect()
-                    else:
-                        await ctx.send("You must be in a voice channel to play music.")
-                        return
-
-                # Queue system
-                if ctx.guild.id not in queues:
-                    queues[ctx.guild.id] = []
-
-                # Start playback if nothing is playing
-                if not voice_clients[ctx.guild.id].is_playing():
-                    await play(ctx, link=selected['url'], title=selected['title'], duration=selected['duration'])
-                else:
-                    queues[ctx.guild.id].append({
-                        "title": selected["title"],
-                        "link": selected["url"],
-                        "duration": selected["duration"]
-                    })
-                    await ctx.send(f"Added to queue: **{selected['title']}** ({format_duration(selected['duration'])})")
+                # Call play() and let it handle connection and queuing
+                await play(
+                    ctx,
+                    link=selected['url'],
+                    title=selected['title'],
+                    duration=selected['duration'],
+                    artist=selected.get('artist'),
+                    album=selected.get('album'),
+                    thumbnail=selected.get('thumbnail')  # if available
+                )
 
             except asyncio.TimeoutError:
                 await ctx.send("You took too long to respond! Search canceled.")
@@ -591,27 +700,95 @@ def run_bot():
             print(e)
             await ctx.send("An error occurred while processing your Plex search.")
 
+    
+    @client.event
+    async def on_reaction_add(reaction, user):
+        if user.bot:
+            return
+
+        message = reaction.message
+        ctx = await client.get_context(message)
+
+        # Make sure the reaction is on a bot message with an embed
+        if not message.embeds or not ctx.guild:
+            return
+
+        emoji = str(reaction.emoji)
+
+        # Only allow control if the user is in a voice channel
+        if not ctx.author.voice or ctx.voice_client is None:
+            return
+
+        try:
+            if emoji == "⏯️":  # Play/Pause toggle
+                vc = voice_clients.get(ctx.guild.id)
+                if vc:
+                    if vc.is_playing():
+                        await ctx.invoke(client.get_command("pause"))
+                    else:
+                        await ctx.invoke(client.get_command("resume"))
+
+            elif emoji == "⏭️":  # Skip
+                await ctx.invoke(client.get_command("skip"))
+
+            elif emoji == "⏮️":  # Restart
+                await ctx.invoke(client.get_command("seek"), seconds=-100000)
+
+        except Exception as e:
+            print(e)
+
+
+
+    # @client.command(name="commands")
+    # async def commands_list(ctx):
+    #     command_list = (
+    #         "**.join** - Mopey bot joins the user's current voice channel\n"
+    #         "**.play <link>** - Play a song (either YouTube link or search query, or resume if paused)\n"
+    #         "**.queue** - Show the current queue\n"
+    #         "**.clear** - Clear the entire queue\n"
+    #         "**.remove <position>** - Remove a specific song from the queue by its position\n"
+    #         "**.playqueue <position>** - Play a specific song from the queue\n"
+    #         "**.pause** - Pause the currently playing song\n"
+    #         "**.resume** - Resume the paused song\n"
+    #         "**.stop** - Stop the song and disconnect from the voice channel\n"
+    #         "**.skip** - Skip the current song and play the next one in the queue\n"
+    #         "**.seek <seconds>** - Fast forward or rewind the current song by the specified number of seconds\n"
+    #         "**.search <query>** - Search YouTube for a query and choose a result to add to the queue\n"
+    #         "**.plex <query>** - Plays the first result returned by <query> from the plex server\n"
+    #         "**.plexsearch <query>** - Search connected Plex server for a query and choose a result to add to the queue\n"
+    #         "**.playing** - Show current song info"
+    #          "**.commands** - Show this list of commands"
+    #     )
+
+    #     await ctx.send(f"Here are the available commands:\n{command_list}")
 
     @client.command(name="commands")
     async def commands_list(ctx):
-        command_list = (
-            "**.join** - Mopey bot joins the user's current voice channel\n"
-            "**.play <link>** - Play a song (either YouTube link or search query, or resume if paused)\n"
-            "**.queue** - Show the current queue\n"
-            "**.clear** - Clear the entire queue\n"
-            "**.remove <position>** - Remove a specific song from the queue by its position\n"
-            "**.playqueue <position>** - Play a specific song from the queue\n"
-            "**.pause** - Pause the currently playing song\n"
-            "**.resume** - Resume the paused song\n"
-            "**.stop** - Stop the song and disconnect from the voice channel\n"
-            "**.skip** - Skip the current song and play the next one in the queue\n"
-            "**.seek <seconds>** - Fast forward or rewind the current song by the specified number of seconds\n"
-            "**.search <query>** - Search YouTube for a query and choose a result to add to the queue\n"
-            "**.plex <query>** - Plays the first result returned by <query> from the plex server\n"
-            "**.plexsearch <query>** - Search connected Plex server for a query and choose a result to add to the queue\n"
-            "**.commands** - Show this list of commands"
-        )
+        embed = discord.Embed(title="Available Commands", color=discord.Color.blurple())
 
-        await ctx.send(f"Here are the available commands:\n{command_list}")
+        command_list = [
+            ("**.clear**", "Clear the entire queue"),
+            ("**.commands**", "Show this list of commands"),
+            ("**.join**", "Mopey bot joins the user's current voice channel"),
+            ("**.pause**", "Pause the currently playing song"),
+            ("**.play <link>**", "Play a song (YouTube link, search query, or resume if paused)"),
+            ("**.playqueue <position>**", "Play a specific song from the queue"),
+            ("**.playing**", "Show current song info"),
+            ("**.plex <query>**", "Plays the first result returned by <query> from the Plex server"),
+            ("**.plexsearch <query>**", "Search connected Plex server for a query and choose a result to add to the queue"),
+            ("**.queue**", "Show the current queue"),
+            ("**.remove <position>**", "Remove a specific song from the queue by its position"),
+            ("**.resume**", "Resume the paused song"),
+            ("**.search <query>**", "Search YouTube for a query and choose a result to add to the queue"),
+            ("**.seek <seconds>**", "Fast forward or rewind the current song by the specified number of seconds"),
+            ("**.skip**", "Skip the current song and play the next one in the queue"),
+            ("**.stop**", "Stop the song and disconnect from the voice channel")
+        ]
+
+        for name, description in command_list:
+            embed.add_field(name=name, value=description, inline=False)
+
+        await ctx.send(embed=embed)
+
 
     client.run(TOKEN)
