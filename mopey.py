@@ -179,7 +179,9 @@ def run_bot():
     @client.event
     async def on_ready():
         print(f'{client.user} is fully operational')
-        check_inactivity.start()  # Start the inactivity check loop
+
+        if not check_inactivity.is_running():
+            check_inactivity.start()  # Start the inactivity check loop
 
     @tasks.loop(seconds=120)  # Runs every 5 minutes
     async def check_inactivity():
