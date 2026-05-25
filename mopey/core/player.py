@@ -21,6 +21,9 @@ import discord
 from .queue import SongQueue
 from .song import Song
 from .sources import AudioSource
+from ..utils.log import get_logger
+
+log = get_logger(__name__)
 
 INACTIVITY_LIMIT = 600  # seconds (10 minutes)
 
@@ -102,13 +105,16 @@ class GuildPlayer:
         if self.is_connected:
             return
         self._voice_client = await channel.connect()
+        log.info(f"[guild={self.guild_id}] Connected to voice channel: #{channel.name}")
 
     async def disconnect(self) -> None:
         self._stopping = True
         if self._voice_client:
+            channel = self._voice_client.channel.name if self._voice_client.channel else "unknown"
             self._voice_client.stop()
             await self._voice_client.disconnect()
             self._voice_client = None
+            log.info(f"[guild={self.guild_id}] Disconnected from voice channel: #{channel}")
         self.current_song = None
 
     # ------------------------------------------------------------------
@@ -122,18 +128,21 @@ class GuildPlayer:
         """
         self._last_activity = time()
 
-        # Always re-resolve to get a fresh stream URL (important for YouTube)
+        log.debug(f"[guild={self.guild_id}] Resolving stream URL for: {song.title!r}")
         resolved = await source.resolve(song)
 
-        # Set state BEFORE starting playback so .playing never sees a None
-        # window between voice_client.play() and the assignment below.
         self.current_song = resolved
         self.start_time = time()
         self._seek_position = 0.0
 
-        # Create the FFmpegOpusAudio in a thread — the constructor spawns a
-        # subprocess and can block the event loop briefly, which causes the
-        # initial speed-up burst at the start of every song.
+        source_name = type(source).__name__.replace("Source", "")
+        artist_info = f" — {resolved.artist}" if resolved.artist else ""
+        log.info(
+            f"[guild={self.guild_id}] Now playing [{source_name}]: "
+            f"{resolved.title!r}{artist_info} "
+            f"(duration={resolved.duration}s, queue_remaining={len(self.queue)})"
+        )
+
         loop = asyncio.get_event_loop()
         audio = await loop.run_in_executor(
             None,
@@ -152,29 +161,35 @@ class GuildPlayer:
         if self._stopping:
             self._stopping = False
             self.current_song = None
+            log.debug(f"[guild={self.guild_id}] Playback stopped (stop/disconnect requested)")
             return
 
         if self._seeking:
-            # seek() will install a new after= handler — nothing to do here
             self._seeking = False
+            log.debug(f"[guild={self.guild_id}] Seek cycle complete")
             return
+
+        finished = self.current_song
+        if finished:
+            log.info(f"[guild={self.guild_id}] Finished: {finished.title!r}")
 
         next_song = self.queue.pop_next()
         if next_song:
-            # Set current_song immediately so .playing works during resolve()
             self.current_song = next_song
+            log.info(f"[guild={self.guild_id}] Advancing queue → {next_song.title!r} ({len(self.queue)} remaining)")
             await self.play_song(next_song, source, ctx)
-            # Notify the channel about what's now playing
             if self._last_channel:
                 from ..ui.now_playing import send_now_playing
                 await send_now_playing(self._last_channel, self, self.bot)
         else:
+            log.info(f"[guild={self.guild_id}] Queue exhausted, playback complete")
             self.current_song = None
 
     def pause(self) -> bool:
         """Pause playback. Returns True if successful."""
         if self.is_playing:
             self._voice_client.pause()
+            log.info(f"[guild={self.guild_id}] Paused: {self.current_song.title!r}")
             return True
         return False
 
@@ -182,6 +197,7 @@ class GuildPlayer:
         """Resume playback. Returns True if successful."""
         if self.is_paused:
             self._voice_client.resume()
+            log.info(f"[guild={self.guild_id}] Resumed: {self.current_song.title!r}")
             return True
         return False
 
@@ -190,6 +206,8 @@ class GuildPlayer:
         self._stopping = True
         if self._voice_client:
             self._voice_client.stop()
+        if self.current_song:
+            log.info(f"[guild={self.guild_id}] Stopped: {self.current_song.title!r}")
         self.current_song = None
 
     async def skip(self) -> bool:
@@ -199,7 +217,8 @@ class GuildPlayer:
         """
         if not self.is_playing:
             return False
-        self._voice_client.stop()  # triggers _after_play via the after= callback
+        log.info(f"[guild={self.guild_id}] Skipped: {self.current_song.title!r}")
+        self._voice_client.stop()
         return True
 
     async def seek(self, seconds: int, source: AudioSource, ctx) -> Optional[float]:
@@ -213,22 +232,24 @@ class GuildPlayer:
 
         was_paused = self.is_paused
 
-        # Can't call _voice_client.stop() while paused without it behaving oddly,
-        # so resume first, then immediately suppress the callback and stop.
         if was_paused:
             self._voice_client.resume()
 
-        # Current position = where we were when we last seeked/started + time since then
         current_position = self._seek_position + (time() - self.start_time)
         new_position = max(0.0, current_position + seconds)
 
         if new_position >= self.current_song.duration:
+            log.debug(
+                f"[guild={self.guild_id}] Seek rejected: "
+                f"target {new_position:.1f}s >= duration {self.current_song.duration}s"
+            )
             return None
 
-        # Set _seeking before stop() so _after_play ignores this callback.
-        # _after_play clears the flag itself — we never unset it here,
-        # because the after= callback fires on a background thread with no
-        # guaranteed timing relative to the lines below.
+        log.info(
+            f"[guild={self.guild_id}] Seek: {current_position:.1f}s → {new_position:.1f}s "
+            f"({'+' if seconds >= 0 else ''}{seconds}s) on {self.current_song.title!r}"
+        )
+
         self._seeking = True
         self._voice_client.stop()
 
@@ -247,7 +268,6 @@ class GuildPlayer:
         self.start_time = time()
         self._seek_position = new_position
 
-        # If we were paused before the seek, re-pause immediately
         if was_paused:
             self._voice_client.pause()
 

@@ -14,6 +14,9 @@ from ..core.song import Song
 from ..ui.now_playing import send_now_playing
 from ..ui.search_menu import show_search_results
 from ..utils.formatting import format_time, format_song_line
+from ..utils.log import get_logger
+
+log = get_logger(__name__)
 
 
 class MusicCog(commands.Cog, name="MusicCog"):
@@ -61,23 +64,23 @@ class MusicCog(commands.Cog, name="MusicCog"):
     async def _play_or_queue(
         self, ctx, song: Song, source: AudioSource
     ) -> None:
-        """
-        Core play logic: if something is already playing, queue the song.
-        Otherwise start playback immediately and show the Now Playing embed.
-        """
         player = await self._ensure_connected(ctx)
         if not player:
             return
 
+        user = f"{ctx.author.name}#{ctx.author.discriminator}"
         if player.is_playing:
             if player.queue.is_full():
+                log.warning(f"[guild={ctx.guild.id}] Queue full, rejected: {song.title!r} (user={user})")
                 await ctx.send("The queue is full. Please wait for some songs to finish.")
                 return
             player.queue.add(song)
             position = len(player.queue)
+            log.info(f"[guild={ctx.guild.id}] Queued at #{position}: {song.title!r} (user={user})")
             line = format_song_line(song.title, song.duration, song.artist, song.album)
             await ctx.send(f"Added to queue: **{line}** (Position: {position})")
         else:
+            log.info(f"[guild={ctx.guild.id}] Playing immediately: {song.title!r} (user={user})")
             self._player_sources[ctx.guild.id] = source
             await player.play_song(song, source, ctx)
             await send_now_playing(ctx, player, self.bot)
@@ -125,7 +128,6 @@ class MusicCog(commands.Cog, name="MusicCog"):
         Play a song by YouTube URL/search query, or resume if paused.
         Usage: .play <url or search terms>
         """
-        # No argument = resume
         if link is None:
             player = self.get_player(ctx.guild.id)
             if player and player.is_paused:
@@ -135,16 +137,17 @@ class MusicCog(commands.Cog, name="MusicCog"):
                 await ctx.send("No music is currently paused to resume.")
             return
 
+        log.info(f"[guild={ctx.guild.id}] .play invoked by {ctx.author.name}: {link!r}")
         await ctx.send("Loading...")
         try:
-            # Search returns Song objects; we use first result for direct .play
             songs = await self._youtube.search(link, limit=1)
             if not songs:
+                log.warning(f"[guild={ctx.guild.id}] No results for: {link!r}")
                 await ctx.send("Could not find that song.")
                 return
             await self._play_or_queue(ctx, songs[0], self._youtube)
         except Exception as e:
-            print(f"[play] Error: {e}")
+            log.error(f"[guild={ctx.guild.id}] Error in .play ({link!r}): {e}", exc_info=True)
             await ctx.send("An error occurred while trying to play the song.")
 
     @commands.command(name="search")
@@ -157,14 +160,16 @@ class MusicCog(commands.Cog, name="MusicCog"):
             await ctx.send("Please provide a search query.")
             return
 
+        log.info(f"[guild={ctx.guild.id}] .search invoked by {ctx.author.name}: {query!r}")
         await ctx.send("Searching...")
         try:
             songs = await self._youtube.search(query, limit=3)
             chosen = await show_search_results(ctx, songs, title="YouTube Search Results")
             if chosen:
+                log.info(f"[guild={ctx.guild.id}] Search selection: {chosen.title!r} (user={ctx.author.name})")
                 await self._play_or_queue(ctx, chosen, self._youtube)
         except Exception as e:
-            print(f"[search] Error: {e}")
+            log.error(f"[guild={ctx.guild.id}] Error in .search ({query!r}): {e}", exc_info=True)
             await ctx.send("An error occurred while processing your search.")
 
     @commands.command(name="playing")

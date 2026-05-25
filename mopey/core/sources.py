@@ -16,6 +16,9 @@ import yt_dlp
 from plexapi.server import PlexServer
 
 from .song import Song
+from ..utils.log import get_logger
+
+log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -50,8 +53,8 @@ class AudioSource(ABC):
 
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
-    "noplaylist": True,        # never expand playlists
-    "playlist_items": "1",     # belt-and-suspenders: if playlist sneaks through, only take item 1
+    "noplaylist": True,
+    "playlist_items": "1",
     "quiet": True,
     "no_warnings": True,
     "default_search": "ytsearch",
@@ -75,10 +78,11 @@ class YouTubeSource(AudioSource):
         rather than treating it as a search string (which would break playlist URLs).
         """
         if _is_url(query):
-            # Strip playlist context — we only want the specific video
+            log.info(f"YouTube direct URL detected, resolving: {query}")
             song = await self.resolve(Song(title="", url="", link=query, duration=0))
             return [song]
 
+        log.info(f"YouTube search: {query!r} (limit={limit})")
         loop = asyncio.get_event_loop()
         data = await loop.run_in_executor(
             None,
@@ -94,6 +98,7 @@ class YouTubeSource(AudioSource):
                 duration=entry.get("duration", 0),
                 thumbnail=entry.get("thumbnail"),
             ))
+        log.info(f"YouTube search {query!r} → {len(songs)} result(s)")
         return songs
 
     async def resolve(self, song: Song) -> Song:
@@ -101,6 +106,7 @@ class YouTubeSource(AudioSource):
         Re-extract to get a fresh, playable stream URL from the YouTube page URL.
         YouTube stream URLs expire, so we always re-resolve just before playing.
         """
+        log.debug(f"YouTube resolving stream URL for: {song.link}")
         loop = asyncio.get_event_loop()
         data = await loop.run_in_executor(
             None,
@@ -109,7 +115,7 @@ class YouTubeSource(AudioSource):
         if "entries" in data:
             data = data["entries"][0]
 
-        return Song(
+        resolved = Song(
             title=data.get("title", song.title),
             url=data["url"],
             link=song.link,
@@ -118,6 +124,8 @@ class YouTubeSource(AudioSource):
             artist=song.artist,
             album=song.album,
         )
+        log.debug(f"YouTube resolved: {resolved.title!r} ({resolved.duration}s)")
+        return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -136,9 +144,9 @@ class PlexSource(AudioSource):
             return self._plex
         try:
             self._plex = PlexServer(self._base_url, self._token)
-            print("✅ Connected to Plex server.")
+            log.info("Connected to Plex server.")
         except Exception as e:
-            print(f"❌ Failed to connect to Plex: {e}")
+            log.error(f"Failed to connect to Plex: {e}", exc_info=True)
             self._plex = None
         return self._plex
 
@@ -159,7 +167,7 @@ class PlexSource(AudioSource):
                 thumbnail=getattr(track, "artUrl", None),
             )
         except Exception as e:
-            print(f"Error parsing Plex track: {e}")
+            log.warning(f"Skipping malformed Plex track ({getattr(track, 'title', '?')}): {e}")
             return None
 
     async def search(self, query: str, limit: int = 3) -> list[Song]:
@@ -173,7 +181,7 @@ class PlexSource(AudioSource):
             try:
                 return conn.search(query, mediatype="track")
             except Exception as e:
-                print(f"Plex search error: {e}")
+                log.error(f"Plex search failed for query {query!r}: {e}", exc_info=True)
                 return []
 
         results = await loop.run_in_executor(None, _search)
@@ -182,6 +190,8 @@ class PlexSource(AudioSource):
             song = self._track_to_song(track)
             if song:
                 songs.append(song)
+
+        log.info(f"Plex search {query!r} → {len(songs)} result(s)")
         return songs
 
     async def resolve(self, song: Song) -> Song:

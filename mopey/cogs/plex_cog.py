@@ -9,7 +9,10 @@ from discord.ext import commands
 
 from ..core.sources import PlexSource
 from ..ui.search_menu import show_search_results
+from ..utils.log import get_logger
 import discord
+
+log = get_logger(__name__)
 
 
 class PlexCog(commands.Cog, name="PlexCog"):
@@ -32,6 +35,7 @@ class PlexCog(commands.Cog, name="PlexCog"):
             await ctx.send("Please provide a song name to search on Plex.")
             return
 
+        log.info(f"[guild={ctx.guild.id}] .plex invoked by {ctx.author.name}: {query!r}")
         await ctx.send(f"Searching Plex for '{query}'...")
         try:
             songs = await self._plex.search(query, limit=1)
@@ -47,7 +51,7 @@ class PlexCog(commands.Cog, name="PlexCog"):
             await music._play_or_queue(ctx, songs[0], self._plex)
 
         except Exception as e:
-            print(f"[plex] Error: {e}")
+            log.error(f"[guild={ctx.guild.id}] Error in .plex ({query!r}): {e}", exc_info=True)
             await ctx.send("An error occurred while trying to play from Plex.")
 
     @commands.command(name="plexsearch")
@@ -60,6 +64,7 @@ class PlexCog(commands.Cog, name="PlexCog"):
             await ctx.send("Please provide a search query for Plex.")
             return
 
+        log.info(f"[guild={ctx.guild.id}] .plexsearch invoked by {ctx.author.name}: {query!r}")
         await ctx.send("Searching Plex...")
         try:
             songs = await self._plex.search(query, limit=3)
@@ -70,6 +75,7 @@ class PlexCog(commands.Cog, name="PlexCog"):
                 color=discord.Color.dark_gold(),
             )
             if chosen:
+                log.info(f"[guild={ctx.guild.id}] Plex search selection: {chosen.title!r} (user={ctx.author.name})")
                 music = self._music_cog()
                 if not music:
                     await ctx.send("Music system is unavailable.")
@@ -77,5 +83,5 @@ class PlexCog(commands.Cog, name="PlexCog"):
                 await music._play_or_queue(ctx, chosen, self._plex)
 
         except Exception as e:
-            print(f"[plexsearch] Error: {e}")
+            log.error(f"[guild={ctx.guild.id}] Error in .plexsearch ({query!r}): {e}", exc_info=True)
             await ctx.send("An error occurred while processing your Plex search.")
