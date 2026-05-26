@@ -9,7 +9,7 @@ import discord
 from discord.ext import commands, tasks
 
 from ..core.player import GuildPlayer
-from ..core.sources import AudioSource, YouTubeSource
+from ..core.sources import AudioSource, YouTubeSource, VideoUnavailableError
 from ..core.song import Song
 from ..ui.now_playing import send_now_playing
 from ..ui.search_menu import show_search_results
@@ -74,11 +74,15 @@ class MusicCog(commands.Cog, name="MusicCog"):
                 log.warning(f"[guild={ctx.guild.id}] Queue full, rejected: {song.title!r} (user={user})")
                 await ctx.send("The queue is full. Please wait for some songs to finish.")
                 return
+            was_empty = player.queue.is_empty()
             player.queue.add(song)
             position = len(player.queue)
             log.info(f"[guild={ctx.guild.id}] Queued at #{position}: {song.title!r} (user={user})")
             line = format_song_line(song.title, song.duration, song.artist, song.album)
             await ctx.send(f"Added to queue: **{line}** (Position: {position})")
+            # If this is the first song in the queue, prefetch it immediately
+            if was_empty:
+                player._schedule_prefetch(source)
         else:
             log.info(f"[guild={ctx.guild.id}] Playing immediately: {song.title!r} (user={user})")
             self._player_sources[ctx.guild.id] = source
@@ -149,12 +153,36 @@ class MusicCog(commands.Cog, name="MusicCog"):
         log.info(f"[guild={ctx.guild.id}] .play invoked by {ctx.author.name}: {link!r}")
         await ctx.send("Loading...")
         try:
-            songs = await self._youtube.search(link, limit=1)
+            is_url = link.startswith("http://") or link.startswith("https://")
+            songs = await self._youtube.search(link, limit=1 if is_url else 3)
             if not songs:
                 log.warning(f"[guild={ctx.guild.id}] No results for: {link!r}")
                 await ctx.send("Couldn't find anything for that. Try a different search or URL.")
                 return
-            await self._play_or_queue(ctx, songs[0], self._youtube)
+
+            if is_url:
+                # Direct URL — show specific reason if it fails, no fallback
+                try:
+                    await self._play_or_queue(ctx, songs[0], self._youtube)
+                except VideoUnavailableError as e:
+                    await ctx.send(str(e))
+                except Exception as e:
+                    log.error(f"[guild={ctx.guild.id}] Error in .play ({link!r}): {e}", exc_info=True)
+                    await ctx.send("Something went wrong loading that song. Try again in a moment.")
+            else:
+                # Search query — silently try each result, generic message if all fail
+                for i, song in enumerate(songs):
+                    try:
+                        await self._play_or_queue(ctx, song, self._youtube)
+                        return
+                    except Exception as e:
+                        log.warning(
+                            f"[guild={ctx.guild.id}] Result {i + 1} unavailable "
+                            f"({song.title!r}): {e}"
+                        )
+                        continue
+                await ctx.send("Couldn't find an available version of that. Try a different search.")
+
         except Exception as e:
             log.error(f"[guild={ctx.guild.id}] Error in .play ({link!r}): {e}", exc_info=True)
             await ctx.send("Something went wrong loading that song. Try again in a moment.")

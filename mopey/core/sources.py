@@ -62,6 +62,30 @@ YTDL_OPTIONS = {
 }
 
 
+def _classify_ytdl_error(error: Exception) -> str:
+    """
+    Map yt-dlp exceptions to user-friendly messages.
+    Returns None if it's not a recognized specific error (caller handles generically).
+    """
+    msg = str(error).lower()
+    if "age" in msg or "sign in" in msg or "inappropriate" in msg:
+        return "That video is age-restricted and can't be played."
+    if "not available" in msg or "unavailable" in msg:
+        return "That video is unavailable in this region."
+    if "private" in msg:
+        return "That video is private."
+    if "removed" in msg or "no longer available" in msg:
+        return "That video has been removed."
+    if "copyright" in msg:
+        return "That video has been blocked due to a copyright claim."
+    return None
+
+
+class VideoUnavailableError(Exception):
+    """Raised when a YouTube video can't be played for a known reason."""
+    pass
+
+
 def _is_url(query: str) -> bool:
     return query.startswith("http://") or query.startswith("https://")
 
@@ -104,14 +128,21 @@ class YouTubeSource(AudioSource):
     async def resolve(self, song: Song) -> Song:
         """
         Re-extract to get a fresh, playable stream URL from the YouTube page URL.
-        YouTube stream URLs expire, so we always re-resolve just before playing.
+        Raises VideoUnavailableError for known issues (age restriction, region block, etc.)
         """
         log.debug(f"YouTube resolving stream URL for: {song.link}")
         loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(
-            None,
-            lambda: self._ytdl.extract_info(song.link, download=False)
-        )
+        try:
+            data = await loop.run_in_executor(
+                None,
+                lambda: self._ytdl.extract_info(song.link, download=False)
+            )
+        except Exception as e:
+            friendly = _classify_ytdl_error(e)
+            if friendly:
+                raise VideoUnavailableError(friendly) from e
+            raise
+
         if "entries" in data:
             data = data["entries"][0]
 

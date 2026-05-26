@@ -46,7 +46,8 @@ _FFMPEG_BEFORE = (
 #   drift rather than speeding up or slowing down the audio stream.
 _FFMPEG_AFTER = (
     "-vn "
-    '-af "volume=0.25,aresample=48000:async=1:first_pts=0"'
+    '-af "volume=0.25,aresample=48000:async=1000:first_pts=0" '
+    "-bufsize 512k"
 )
 
 FFMPEG_OPTIONS = {
@@ -85,6 +86,13 @@ class GuildPlayer:
         self._stopping: bool = False  # True when stop() should NOT advance the queue
         self._seeking: bool = False   # True when seek() is mid stop/restart cycle
 
+        # Prefetch: resolved song + ready-to-play audio object for the next queued song.
+        # Populated in the background while the current song is playing so the
+        # transition between songs doesn't block the event loop.
+        self._prefetched_song: Optional[Song] = None
+        self._prefetched_audio: Optional[discord.FFmpegOpusAudio] = None
+        self._prefetch_task: Optional[asyncio.Task] = None
+
     # ------------------------------------------------------------------
     # Voice connection
     # ------------------------------------------------------------------
@@ -109,6 +117,7 @@ class GuildPlayer:
 
     async def disconnect(self) -> None:
         self._stopping = True
+        self._clear_prefetch()
         if self._voice_client:
             channel = self._voice_client.channel.name if self._voice_client.channel else "unknown"
             self._voice_client.stop()
@@ -121,18 +130,82 @@ class GuildPlayer:
     # Playback
     # ------------------------------------------------------------------
 
+    async def _prefetch_next(self, source: AudioSource) -> None:
+        """
+        Resolve and pre-create the FFmpegOpusAudio for the next queued song
+        while the current song is still playing. This way the transition between
+        songs requires no blocking work on the event loop.
+        """
+        next_song = self.queue.peek_next()
+        if not next_song:
+            return
+
+        try:
+            log.debug(f"[guild={self.guild_id}] Prefetching: {next_song.title!r}")
+            resolved = await source.resolve(next_song)
+
+            loop = asyncio.get_event_loop()
+            audio = await loop.run_in_executor(
+                None,
+                lambda: discord.FFmpegOpusAudio(resolved.url, **FFMPEG_OPTIONS)
+            )
+
+            # Only store if the queue hasn't changed since we started prefetching
+            if self.queue.peek_next() and self.queue.peek_next().title == next_song.title:
+                self._prefetched_song = resolved
+                self._prefetched_audio = audio
+                log.debug(f"[guild={self.guild_id}] Prefetch ready: {resolved.title!r}")
+            else:
+                log.debug(f"[guild={self.guild_id}] Prefetch discarded (queue changed)")
+
+        except Exception as e:
+            # Prefetch failure is non-fatal — play_song will resolve normally as fallback
+            log.warning(f"[guild={self.guild_id}] Prefetch failed for {next_song.title!r}: {e}")
+            self._prefetched_song = None
+            self._prefetched_audio = None
+
+    def _clear_prefetch(self) -> None:
+        """Discard any prefetched data, e.g. when the queue changes or we seek."""
+        if self._prefetch_task and not self._prefetch_task.done():
+            self._prefetch_task.cancel()
+        self._prefetch_task = None
+        self._prefetched_song = None
+        self._prefetched_audio = None
+
+    def _schedule_prefetch(self, source: AudioSource) -> None:
+        """Schedule prefetch as a background task so it doesn't block play_song."""
+        self._clear_prefetch()
+        self._prefetch_task = asyncio.ensure_future(self._prefetch_next(source))
+
     async def play_song(self, song: Song, source: AudioSource, after_ctx) -> None:
         """
         Resolve the song's stream URL and begin playback.
-        `after_ctx` is the discord Context used to chain play_next callbacks.
-        Handles its own errors — on failure it attempts to skip to the next
-        queued song rather than going silent.
+        Uses prefetched audio if available, otherwise resolves on demand.
+        On failure, attempts to skip to the next queued song.
         """
         self._last_activity = time()
 
         try:
-            log.debug(f"[guild={self.guild_id}] Resolving stream URL for: {song.title!r}")
-            resolved = await source.resolve(song)
+            # Use prefetched data if it matches this song
+            if (
+                self._prefetched_song is not None
+                and self._prefetched_audio is not None
+                and self._prefetched_song.link == song.link
+            ):
+                log.debug(f"[guild={self.guild_id}] Using prefetched audio for: {song.title!r}")
+                resolved = self._prefetched_song
+                audio = self._prefetched_audio
+                self._prefetched_song = None
+                self._prefetched_audio = None
+            else:
+                log.debug(f"[guild={self.guild_id}] Resolving stream URL for: {song.title!r}")
+                resolved = await source.resolve(song)
+
+                loop = asyncio.get_event_loop()
+                audio = await loop.run_in_executor(
+                    None,
+                    lambda: discord.FFmpegOpusAudio(resolved.url, **FFMPEG_OPTIONS)
+                )
 
             self.current_song = resolved
             self.start_time = time()
@@ -146,16 +219,14 @@ class GuildPlayer:
                 f"(duration={resolved.duration}s, queue_remaining={len(self.queue)})"
             )
 
-            loop = asyncio.get_event_loop()
-            audio = await loop.run_in_executor(
-                None,
-                lambda: discord.FFmpegOpusAudio(resolved.url, **FFMPEG_OPTIONS)
-            )
-
             self._voice_client.play(
                 audio,
                 after=lambda e: self._on_audio_error(e, after_ctx, source)
             )
+
+            # Start prefetching the next song in the background
+            if not self.queue.is_empty():
+                self._schedule_prefetch(source)
 
         except Exception as e:
             log.error(
@@ -163,7 +234,6 @@ class GuildPlayer:
                 exc_info=True
             )
             self.current_song = None
-            # Notify the channel and try to recover by advancing the queue
             await self._recover_from_error(
                 after_ctx, source,
                 f"Couldn't load **{song.title}** — skipping to next song."
@@ -197,6 +267,7 @@ class GuildPlayer:
         and advancing to the next queued song. Cleans up state regardless.
         """
         self.current_song = None
+        self._clear_prefetch()
 
         if self._last_channel:
             try:
@@ -246,7 +317,6 @@ class GuildPlayer:
             else:
                 log.info(f"[guild={self.guild_id}] Queue exhausted, playback complete")
                 self.current_song = None
-
         except Exception as e:
             log.error(
                 f"[guild={self.guild_id}] Unexpected error in _after_play: {e}",
@@ -273,6 +343,7 @@ class GuildPlayer:
     def stop(self) -> None:
         """Stop playback without advancing the queue (used for hard stop and disconnect)."""
         self._stopping = True
+        self._clear_prefetch()
         if self._voice_client:
             self._voice_client.stop()
         if self.current_song:
@@ -320,6 +391,7 @@ class GuildPlayer:
         )
 
         self._seeking = True
+        self._clear_prefetch()
         self._voice_client.stop()
 
         options = _ffmpeg_options_with_seek(new_position)
