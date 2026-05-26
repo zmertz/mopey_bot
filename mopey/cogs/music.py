@@ -91,10 +91,19 @@ class MusicCog(commands.Cog, name="MusicCog"):
 
     @tasks.loop(seconds=120)
     async def _inactivity_check(self):
-        for player in list(self._players.values()):
-            disconnected = await player.check_inactivity()
-            if disconnected:
-                del self._players[player.guild_id]
+        try:
+            for player in list(self._players.values()):
+                disconnected = await player.check_inactivity()
+                if disconnected:
+                    del self._players[player.guild_id]
+        except Exception as e:
+            log.error(f"Error in inactivity check loop: {e}", exc_info=True)
+
+    @_inactivity_check.error
+    async def _inactivity_check_error(self, error):
+        # If the task itself crashes, log it and restart
+        log.error(f"Inactivity check task crashed, restarting: {error}", exc_info=True)
+        self._inactivity_check.restart()
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -143,12 +152,12 @@ class MusicCog(commands.Cog, name="MusicCog"):
             songs = await self._youtube.search(link, limit=1)
             if not songs:
                 log.warning(f"[guild={ctx.guild.id}] No results for: {link!r}")
-                await ctx.send("Could not find that song.")
+                await ctx.send("Couldn't find anything for that. Try a different search or URL.")
                 return
             await self._play_or_queue(ctx, songs[0], self._youtube)
         except Exception as e:
             log.error(f"[guild={ctx.guild.id}] Error in .play ({link!r}): {e}", exc_info=True)
-            await ctx.send("An error occurred while trying to play the song.")
+            await ctx.send("Something went wrong loading that song. Try again in a moment.")
 
     @commands.command(name="search")
     async def search(self, ctx, *, query: str = None):
@@ -170,7 +179,7 @@ class MusicCog(commands.Cog, name="MusicCog"):
                 await self._play_or_queue(ctx, chosen, self._youtube)
         except Exception as e:
             log.error(f"[guild={ctx.guild.id}] Error in .search ({query!r}): {e}", exc_info=True)
-            await ctx.send("An error occurred while processing your search.")
+            await ctx.send("Search failed. Try again in a moment.")
 
     @commands.command(name="playing")
     async def playing(self, ctx):

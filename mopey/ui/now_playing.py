@@ -23,7 +23,7 @@ async def send_now_playing(
 
     song = player.current_song
     if not song:
-        await destination.send("❌ No song is currently playing.")
+        await destination.send("No song is currently playing.")
         return
 
     elapsed = player.elapsed
@@ -37,7 +37,7 @@ async def send_now_playing(
             next_song.title, next_song.duration, next_song.artist, next_song.album
         )
     else:
-        next_detail = "❌ `Nothing next in queue`"
+        next_detail = "`Nothing next in queue`"
 
     embed = discord.Embed(
         title="Now Playing",

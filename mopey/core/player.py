@@ -125,64 +125,133 @@ class GuildPlayer:
         """
         Resolve the song's stream URL and begin playback.
         `after_ctx` is the discord Context used to chain play_next callbacks.
+        Handles its own errors — on failure it attempts to skip to the next
+        queued song rather than going silent.
         """
         self._last_activity = time()
 
-        log.debug(f"[guild={self.guild_id}] Resolving stream URL for: {song.title!r}")
-        resolved = await source.resolve(song)
+        try:
+            log.debug(f"[guild={self.guild_id}] Resolving stream URL for: {song.title!r}")
+            resolved = await source.resolve(song)
 
-        self.current_song = resolved
-        self.start_time = time()
-        self._seek_position = 0.0
+            self.current_song = resolved
+            self.start_time = time()
+            self._seek_position = 0.0
 
-        source_name = type(source).__name__.replace("Source", "")
-        artist_info = f" — {resolved.artist}" if resolved.artist else ""
-        log.info(
-            f"[guild={self.guild_id}] Now playing [{source_name}]: "
-            f"{resolved.title!r}{artist_info} "
-            f"(duration={resolved.duration}s, queue_remaining={len(self.queue)})"
-        )
-
-        loop = asyncio.get_event_loop()
-        audio = await loop.run_in_executor(
-            None,
-            lambda: discord.FFmpegOpusAudio(resolved.url, **FFMPEG_OPTIONS)
-        )
-
-        self._voice_client.play(
-            audio,
-            after=lambda e: asyncio.run_coroutine_threadsafe(
-                self._after_play(after_ctx, source), self.bot.loop
+            source_name = type(source).__name__.replace("Source", "")
+            artist_info = f" — {resolved.artist}" if resolved.artist else ""
+            log.info(
+                f"[guild={self.guild_id}] Now playing [{source_name}]: "
+                f"{resolved.title!r}{artist_info} "
+                f"(duration={resolved.duration}s, queue_remaining={len(self.queue)})"
             )
-        )
 
-    async def _after_play(self, ctx, source: AudioSource) -> None:
-        """Called automatically when a song finishes. Plays next or clears state."""
-        if self._stopping:
-            self._stopping = False
+            loop = asyncio.get_event_loop()
+            audio = await loop.run_in_executor(
+                None,
+                lambda: discord.FFmpegOpusAudio(resolved.url, **FFMPEG_OPTIONS)
+            )
+
+            self._voice_client.play(
+                audio,
+                after=lambda e: self._on_audio_error(e, after_ctx, source)
+            )
+
+        except Exception as e:
+            log.error(
+                f"[guild={self.guild_id}] Failed to play {song.title!r}: {e}",
+                exc_info=True
+            )
             self.current_song = None
-            log.debug(f"[guild={self.guild_id}] Playback stopped (stop/disconnect requested)")
-            return
+            # Notify the channel and try to recover by advancing the queue
+            await self._recover_from_error(
+                after_ctx, source,
+                f"Couldn't load **{song.title}** — skipping to next song."
+            )
 
-        if self._seeking:
-            self._seeking = False
-            log.debug(f"[guild={self.guild_id}] Seek cycle complete")
-            return
+    def _on_audio_error(self, error, ctx, source: AudioSource) -> None:
+        """
+        Called by discord.py's AudioPlayer thread when FFmpeg dies mid-stream.
+        Schedules _after_play normally if no error, or recovery if there was one.
+        """
+        if error:
+            log.error(
+                f"[guild={self.guild_id}] FFmpeg error mid-stream: {error}",
+                exc_info=error
+            )
+            asyncio.run_coroutine_threadsafe(
+                self._recover_from_error(
+                    ctx, source,
+                    "The stream dropped unexpectedly — skipping to next song."
+                ),
+                self.bot.loop
+            )
+        else:
+            asyncio.run_coroutine_threadsafe(
+                self._after_play(ctx, source), self.bot.loop
+            )
 
-        finished = self.current_song
-        if finished:
-            log.info(f"[guild={self.guild_id}] Finished: {finished.title!r}")
+    async def _recover_from_error(self, ctx, source: AudioSource, message: str) -> None:
+        """
+        Attempt to recover from a playback error by notifying the channel
+        and advancing to the next queued song. Cleans up state regardless.
+        """
+        self.current_song = None
+
+        if self._last_channel:
+            try:
+                await self._last_channel.send(message)
+            except Exception:
+                pass  # Don't let a send failure mask the original error
 
         next_song = self.queue.pop_next()
         if next_song:
+            log.info(f"[guild={self.guild_id}] Recovering — advancing to: {next_song.title!r}")
             self.current_song = next_song
-            log.info(f"[guild={self.guild_id}] Advancing queue → {next_song.title!r} ({len(self.queue)} remaining)")
             await self.play_song(next_song, source, ctx)
-            if self._last_channel:
-                from ..ui.now_playing import send_now_playing
-                await send_now_playing(self._last_channel, self, self.bot)
         else:
-            log.info(f"[guild={self.guild_id}] Queue exhausted, playback complete")
+            log.info(f"[guild={self.guild_id}] Recovery: queue exhausted, stopping.")
+            if self._last_channel:
+                try:
+                    await self._last_channel.send("Nothing left in the queue to play.")
+                except Exception:
+                    pass
+
+    async def _after_play(self, ctx, source: AudioSource) -> None:
+        """Called automatically when a song finishes cleanly."""
+        try:
+            if self._stopping:
+                self._stopping = False
+                self.current_song = None
+                log.debug(f"[guild={self.guild_id}] Playback stopped (stop/disconnect requested)")
+                return
+
+            if self._seeking:
+                self._seeking = False
+                log.debug(f"[guild={self.guild_id}] Seek cycle complete")
+                return
+
+            finished = self.current_song
+            if finished:
+                log.info(f"[guild={self.guild_id}] Finished: {finished.title!r}")
+
+            next_song = self.queue.pop_next()
+            if next_song:
+                self.current_song = next_song
+                log.info(f"[guild={self.guild_id}] Advancing queue → {next_song.title!r} ({len(self.queue)} remaining)")
+                await self.play_song(next_song, source, ctx)
+                if self._last_channel:
+                    from ..ui.now_playing import send_now_playing
+                    await send_now_playing(self._last_channel, self, self.bot)
+            else:
+                log.info(f"[guild={self.guild_id}] Queue exhausted, playback complete")
+                self.current_song = None
+
+        except Exception as e:
+            log.error(
+                f"[guild={self.guild_id}] Unexpected error in _after_play: {e}",
+                exc_info=True
+            )
             self.current_song = None
 
     def pause(self) -> bool:
@@ -261,9 +330,7 @@ class GuildPlayer:
         )
         self._voice_client.play(
             audio,
-            after=lambda e: asyncio.run_coroutine_threadsafe(
-                self._after_play(ctx, source), self.bot.loop
-            )
+            after=lambda e: self._on_audio_error(e, ctx, source)
         )
         self.start_time = time()
         self._seek_position = new_position

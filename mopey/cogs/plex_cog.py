@@ -40,7 +40,7 @@ class PlexCog(commands.Cog, name="PlexCog"):
         try:
             songs = await self._plex.search(query, limit=1)
             if not songs:
-                await ctx.send("No songs found on Plex.")
+                await ctx.send("No results found on Plex for that query.")
                 return
 
             music = self._music_cog()
@@ -52,7 +52,7 @@ class PlexCog(commands.Cog, name="PlexCog"):
 
         except Exception as e:
             log.error(f"[guild={ctx.guild.id}] Error in .plex ({query!r}): {e}", exc_info=True)
-            await ctx.send("An error occurred while trying to play from Plex.")
+            await ctx.send("Couldn't reach Plex. Try again in a moment.")
 
     @commands.command(name="plexsearch")
     async def plexsearch(self, ctx, *, query: str = None):
@@ -84,4 +84,4 @@ class PlexCog(commands.Cog, name="PlexCog"):
 
         except Exception as e:
             log.error(f"[guild={ctx.guild.id}] Error in .plexsearch ({query!r}): {e}", exc_info=True)
-            await ctx.send("An error occurred while processing your Plex search.")
+            await ctx.send("Plex search failed. Try again in a moment.")

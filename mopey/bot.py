@@ -52,6 +52,34 @@ def run_bot():
         log.info(f"Logged in as {bot.user} (id={bot.user.id})")
         log.info(f"Connected to {len(bot.guilds)} guild(s): {', '.join(g.name for g in bot.guilds)}")
 
+    @bot.event
+    async def on_command_error(ctx, error):
+        # Unwrap the discord.py wrapper to get the real exception
+        if isinstance(error, discord.ext.commands.CommandInvokeError):
+            error = error.original
+
+        if isinstance(error, discord.ext.commands.CommandNotFound):
+            return  # Silently ignore unknown commands
+
+        if isinstance(error, discord.ext.commands.MissingRequiredArgument):
+            await ctx.send(f"Missing argument: `{error.param.name}`. Try **.commands** for usage info.")
+            return
+
+        if isinstance(error, discord.ext.commands.BadArgument):
+            await ctx.send(f"That doesn't look right. Try **.commands** for usage info.")
+            return
+
+        if isinstance(error, discord.ext.commands.CheckFailure):
+            await ctx.send("You don't have permission to use that command.")
+            return
+
+        log.error(
+            f"Unhandled error in command '{ctx.command}' "
+            f"(guild={ctx.guild.id}, user={ctx.author.name}): {error}",
+            exc_info=error
+        )
+        await ctx.send("Something went wrong. Try again in a moment.")
+
     import asyncio
 
     async def main():
