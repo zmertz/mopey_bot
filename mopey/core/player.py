@@ -125,6 +125,7 @@ class GuildPlayer:
             self._voice_client = None
             log.info(f"[guild={self.guild_id}] Disconnected from voice channel: #{channel}")
         self.current_song = None
+        await self.bot.change_presence(activity=None)
 
     # ------------------------------------------------------------------
     # Playback
@@ -224,6 +225,14 @@ class GuildPlayer:
                 after=lambda e: self._on_audio_error(e, after_ctx, source)
             )
 
+            # Update bot presence to show the current song
+            await self.bot.change_presence(
+                activity=discord.Activity(
+                    type=discord.ActivityType.playing,
+                    name=f"🎵 Playing: {resolved.title}"
+                )
+            )
+
             # Start prefetching the next song in the background
             if not self.queue.is_empty():
                 self._schedule_prefetch(source)
@@ -317,6 +326,7 @@ class GuildPlayer:
             else:
                 log.info(f"[guild={self.guild_id}] Queue exhausted, playback complete")
                 self.current_song = None
+                await self.bot.change_presence(activity=None)
         except Exception as e:
             log.error(
                 f"[guild={self.guild_id}] Unexpected error in _after_play: {e}",
@@ -349,6 +359,7 @@ class GuildPlayer:
         if self.current_song:
             log.info(f"[guild={self.guild_id}] Stopped: {self.current_song.title!r}")
         self.current_song = None
+        asyncio.ensure_future(self.bot.change_presence(activity=None))
 
     async def skip(self) -> bool:
         """

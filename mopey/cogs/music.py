@@ -79,7 +79,10 @@ class MusicCog(commands.Cog, name="MusicCog"):
             position = len(player.queue)
             log.info(f"[guild={ctx.guild.id}] Queued at #{position}: {song.title!r} (user={user})")
             line = format_song_line(song.title, song.duration, song.artist, song.album)
-            await ctx.send(f"Added to queue: **{line}** (Position: {position})")
+            embed = discord.Embed(title="Added to Queue", color=discord.Color.blurple())
+            embed.add_field(name="\u200b", value=line, inline=False)
+            embed.set_footer(text=f"Position: {position}")
+            await ctx.send(embed=embed)
             # If this is the first song in the queue, prefetch it immediately
             if was_empty:
                 player._schedule_prefetch(source)
@@ -151,28 +154,23 @@ class MusicCog(commands.Cog, name="MusicCog"):
             return
 
         log.info(f"[guild={ctx.guild.id}] .play invoked by {ctx.author.name}: {link!r}")
-        await ctx.send("Loading...")
+        loading_msg = await ctx.send("Loading...")
         try:
             is_url = link.startswith("http://") or link.startswith("https://")
             songs = await self._youtube.search(link, limit=1 if is_url else 3)
             if not songs:
                 log.warning(f"[guild={ctx.guild.id}] No results for: {link!r}")
+                await loading_msg.delete()
                 await ctx.send("Couldn't find anything for that. Try a different search or URL.")
                 return
 
             if is_url:
-                # Direct URL — show specific reason if it fails, no fallback
-                try:
-                    await self._play_or_queue(ctx, songs[0], self._youtube)
-                except VideoUnavailableError as e:
-                    await ctx.send(str(e))
-                except Exception as e:
-                    log.error(f"[guild={ctx.guild.id}] Error in .play ({link!r}): {e}", exc_info=True)
-                    await ctx.send("Something went wrong loading that song. Try again in a moment.")
+                await loading_msg.delete()
+                await self._play_or_queue(ctx, songs[0], self._youtube)
             else:
-                # Search query — silently try each result, generic message if all fail
                 for i, song in enumerate(songs):
                     try:
+                        await loading_msg.delete()
                         await self._play_or_queue(ctx, song, self._youtube)
                         return
                     except Exception as e:
@@ -183,8 +181,12 @@ class MusicCog(commands.Cog, name="MusicCog"):
                         continue
                 await ctx.send("Couldn't find an available version of that. Try a different search.")
 
+        except VideoUnavailableError as e:
+            await loading_msg.delete()
+            await ctx.send(str(e))
         except Exception as e:
             log.error(f"[guild={ctx.guild.id}] Error in .play ({link!r}): {e}", exc_info=True)
+            await loading_msg.delete()
             await ctx.send("Something went wrong loading that song. Try again in a moment.")
 
     @commands.command(name="search")
@@ -198,15 +200,17 @@ class MusicCog(commands.Cog, name="MusicCog"):
             return
 
         log.info(f"[guild={ctx.guild.id}] .search invoked by {ctx.author.name}: {query!r}")
-        await ctx.send("Searching...")
+        searching_msg = await ctx.send("Searching...")
         try:
             songs = await self._youtube.search(query, limit=3)
+            await searching_msg.delete()
             chosen = await show_search_results(ctx, songs, title="YouTube Search Results")
             if chosen:
                 log.info(f"[guild={ctx.guild.id}] Search selection: {chosen.title!r} (user={ctx.author.name})")
                 await self._play_or_queue(ctx, chosen, self._youtube)
         except Exception as e:
             log.error(f"[guild={ctx.guild.id}] Error in .search ({query!r}): {e}", exc_info=True)
+            await searching_msg.delete()
             await ctx.send("Search failed. Try again in a moment.")
 
     @commands.command(name="playing")
@@ -222,22 +226,41 @@ class MusicCog(commands.Cog, name="MusicCog"):
     async def queue(self, ctx):
         """Show the current queue."""
         player = self.get_player(ctx.guild.id)
-        if not player or player.queue.is_empty():
-            await ctx.send("The queue is empty!")
+
+        has_current = player and player.current_song
+        has_queue = player and not player.queue.is_empty()
+
+        if not has_current and not has_queue:
+            await ctx.send("Nothing is playing and the queue is empty.")
             return
 
-        embed = discord.Embed(title="🎶 Current Queue 🎶", color=discord.Color.blurple())
-        for idx, song in enumerate(player.queue[:5], start=1):
-            line = format_song_line(song.title, song.duration, song.artist, song.album)
-            embed.add_field(name="\u200b", value=f"**{idx}.** {line}", inline=False)
+        embed = discord.Embed(title="Queue", color=discord.Color.blurple())
 
-        remaining = len(player.queue) - 5
-        if remaining > 0:
+        if has_current:
+            song = player.current_song
+            line = format_song_line(song.title, song.duration, song.artist, song.album)
             embed.add_field(
-                name="\u200b",
-                value=f"*...and {remaining} more song{'s' if remaining != 1 else ''} in the queue.*",
-                inline=False,
+                name="Now Playing",
+                value=line,
+                inline=False
             )
+
+        if has_queue:
+            embed.add_field(name="\u200b", value="**Up Next**", inline=False)
+            for idx, song in enumerate(player.queue[:5], start=1):
+                line = format_song_line(song.title, song.duration, song.artist, song.album)
+                embed.add_field(name="\u200b", value=f"**{idx}.** {line}", inline=False)
+
+            remaining = len(player.queue) - 5
+            if remaining > 0:
+                embed.add_field(
+                    name="\u200b",
+                    value=f"*...and {remaining} more song{'s' if remaining != 1 else ''} in the queue.*",
+                    inline=False,
+                )
+        elif has_current:
+            embed.add_field(name="\u200b", value="*Nothing else in the queue.*", inline=False)
+
         await ctx.send(embed=embed)
 
     @commands.command(name="clear")

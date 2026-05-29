@@ -32,15 +32,15 @@ class PlaybackControls(View):
     async def play_button(self, interaction: Interaction, btn):
         await interaction.response.defer()
         player = self._get_player(self._guild_id(interaction))
-        if player:
-            player.resume()
+        if player and player.resume():
+            await interaction.followup.send("Music resumed!")
 
     @button(label="⏸", style=ButtonStyle.blurple)
     async def pause_button(self, interaction: Interaction, btn):
         await interaction.response.defer()
         player = self._get_player(self._guild_id(interaction))
-        if player:
-            player.pause()
+        if player and player.pause():
+            await interaction.followup.send("Music paused!")
 
     @button(label="⟲", style=ButtonStyle.blurple)
     async def restart_button(self, interaction: Interaction, btn):
@@ -48,15 +48,15 @@ class PlaybackControls(View):
         player = self._get_player(self._guild_id(interaction))
         cog = self._bot.cogs.get("MusicCog")
         if player and cog:
-            # Seek to beginning by seeking far back
             await player.seek(-99999, cog.get_source_for_player(player), self._ctx_or_channel)
+            await interaction.followup.send("Restarting song.")
 
     @button(label="⏭", style=ButtonStyle.blurple)
     async def skip_button(self, interaction: Interaction, btn):
         await interaction.response.defer()
         player = self._get_player(self._guild_id(interaction))
-        if player:
-            await player.skip()
+        if player and await player.skip():
+            await interaction.followup.send("Song skipped.")
 
     @button(label="⏹", style=ButtonStyle.danger)
     async def stop_button(self, interaction: Interaction, btn):
@@ -64,3 +64,4 @@ class PlaybackControls(View):
         player = self._get_player(self._guild_id(interaction))
         if player:
             await player.disconnect()
+            await interaction.followup.send("Bot disconnected.")
