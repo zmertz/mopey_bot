@@ -54,11 +54,17 @@ class AudioSource(ABC):
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
     "noplaylist": True,
-    "playlist_items": "1",
     "quiet": True,
     "no_warnings": True,
+    "ignoreerrors": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
+}
+
+# Used only when resolving a direct URL to prevent playlist expansion
+YTDL_OPTIONS_RESOLVE = {
+    **YTDL_OPTIONS,
+    "playlist_items": "1",
 }
 
 
@@ -94,6 +100,7 @@ class YouTubeSource(AudioSource):
 
     def __init__(self):
         self._ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+        self._ytdl_resolve = yt_dlp.YoutubeDL(YTDL_OPTIONS_RESOLVE)
 
     async def search(self, query: str, limit: int = 3) -> list[Song]:
         """
@@ -108,11 +115,17 @@ class YouTubeSource(AudioSource):
 
         log.info(f"YouTube search: {query!r} (limit={limit})")
         loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(
-            None,
-            lambda: self._ytdl.extract_info(f"ytsearch{limit}:{query}", download=False)
-        )
-        entries = data.get("entries", [])
+        try:
+            data = await loop.run_in_executor(
+                None,
+                lambda: self._ytdl.extract_info(f"ytsearch{limit}:{query}", download=False)
+            )
+        except Exception as e:
+            friendly = _classify_ytdl_error(e)
+            if friendly:
+                raise VideoUnavailableError(friendly) from e
+            raise
+        entries = [e for e in (data.get("entries", []) if data else []) if e is not None]
         songs = []
         for entry in entries[:limit]:
             songs.append(Song(
@@ -135,7 +148,7 @@ class YouTubeSource(AudioSource):
         try:
             data = await loop.run_in_executor(
                 None,
-                lambda: self._ytdl.extract_info(song.link, download=False)
+                lambda: self._ytdl_resolve.extract_info(song.link, download=False)
             )
         except Exception as e:
             friendly = _classify_ytdl_error(e)

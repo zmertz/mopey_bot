@@ -55,8 +55,9 @@ class PlaybackControls(View):
     async def skip_button(self, interaction: Interaction, btn):
         await interaction.response.defer()
         player = self._get_player(self._guild_id(interaction))
-        if player and await player.skip():
+        if player and player.is_playing:
             await interaction.followup.send("Song skipped.")
+            await player.skip()
 
     @button(label="⏹", style=ButtonStyle.danger)
     async def stop_button(self, interaction: Interaction, btn):
@@ -64,4 +65,4 @@ class PlaybackControls(View):
         player = self._get_player(self._guild_id(interaction))
         if player:
             await player.disconnect()
-            await interaction.followup.send("Bot disconnected.")
+            await interaction.followup.send("Music stopped and disconnected.")
